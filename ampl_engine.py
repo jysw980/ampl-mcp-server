@@ -32,7 +32,7 @@ from schemas import (
     InfeasibleConstraint,
     InfeasibleDiagnostics,
 )
-from utils import logger, timestamp_iso
+from utils import logger, timestamp_iso, safe_path
 
 # ─── AMPL installation detection ──────────────────────────────────────────────
 
@@ -612,6 +612,248 @@ class AMPLEngine:
             "message": f"Set {len(set_opts)} solver option(s) on {self.current_solver}",
         }
 
+    # ── .run script execution ─────────────────────────────────────────────
+
+    def run_script(self, script_code: str, save_path: Optional[str] = None) -> dict:
+        """
+        Execute an AMPL .run script (command file).
+
+        .run files can contain loops, conditionals, multiple solve statements,
+        display commands, and parameter updates — far more powerful than
+        injecting model code alone.
+
+        If *save_path* is given, the script is also written to disk so the
+        user can re-run or inspect it.
+        """
+        ampl = self.ensure_runtime()
+        captured = io.StringIO()
+        errors: list[str] = []
+        solve_results: list[dict] = []
+        t0 = time.perf_counter()
+
+        # Optionally save to disk
+        disk_path: Optional[Path] = None
+        if save_path:
+            disk_path = safe_path(save_path)
+            try:
+                Path(disk_path).parent.mkdir(parents=True, exist_ok=True)
+                Path(disk_path).write_text(script_code, encoding="utf-8")
+                logger.info("Script saved to %s", disk_path)
+            except Exception as exc:
+                errors.append(f"Failed to save script: {exc}")
+
+        # Execute via ampl.eval() — AMPL processes .run commands the same way
+        try:
+            with redirect_stdout(captured):
+                # Preprocess: intercept 'solve;' calls to track per-solve results
+                statements = self._split_ampl_statements(script_code)
+                solve_count = 0
+                for stmt in statements:
+                    stmt_stripped = stmt.strip()
+                    if not stmt_stripped:
+                        continue
+
+                    t_stmt = time.perf_counter()
+                    try:
+                        ampl.eval(stmt)
+                    except Exception as eval_exc:
+                        errors.append(f"Statement error: {eval_exc}\n  near: {stmt_stripped[:200]}")
+                        logger.warning("Script statement failed: %s", eval_exc)
+
+                    # If this statement was a solve, capture the result
+                    if stmt_stripped.startswith("solve") or stmt_stripped == "solve;":
+                        solve_count += 1
+                        try:
+                            sr = str(ampl.solve_result)
+                            obj = self._extract_objective(ampl)
+                            solve_results.append({
+                                "solve_index": solve_count,
+                                "label": "",
+                                "solve_result": sr,
+                                "objective_value": obj,
+                                "runtime_seconds": round(time.perf_counter() - t_stmt, 4),
+                            })
+                            self.last_solve_result = sr
+                            self.last_objective = obj
+                        except Exception:
+                            solve_results.append({
+                                "solve_index": solve_count,
+                                "label": "",
+                                "solve_result": "unknown",
+                                "objective_value": None,
+                                "runtime_seconds": round(time.perf_counter() - t_stmt, 4),
+                            })
+        except Exception as exc:
+            errors.append(f"Script execution failed: {exc}")
+            logger.error("run_script exception: %s", exc)
+
+        captured.seek(0)
+        stdout = captured.read()
+        total_elapsed = time.perf_counter() - t0
+
+        self.loaded_models.append(f"<run script (solves={len(solve_results)})>")
+        logger.info(
+            "Script executed | solves=%d | errors=%d | time=%.3fs",
+            len(solve_results), len(errors), total_elapsed,
+        )
+
+        return {
+            "status": "error" if errors else "success",
+            "message": f"Script executed: {len(solve_results)} solve(s), {len(errors)} error(s) in {total_elapsed:.3f}s",
+            "script_path": str(disk_path) if disk_path else None,
+            "total_solves": len(solve_results),
+            "solve_results": solve_results,
+            "ampl_stdout": stdout,
+            "errors": errors,
+        }
+
+    @staticmethod
+    def _split_ampl_statements(code: str) -> list[str]:
+        """
+        Split AMPL code into individual statements, respecting:
+          - Semicolons that end statements
+          - Compound statements (for { }, repeat { }, if { })
+          - Multi-line quoted strings
+        Returns a list of complete AMPL statements.
+        """
+        statements: list[str] = []
+        depth = 0          # brace depth
+        current: list[str] = []
+        in_single_quote = False
+        in_double_quote = False
+        i = 0
+
+        while i < len(code):
+            ch = code[i]
+
+            # Quote toggling (skip escaped quotes)
+            if ch == "'" and not in_double_quote:
+                if i == 0 or code[i - 1] != "\\":
+                    in_single_quote = not in_single_quote
+            elif ch == '"' and not in_single_quote:
+                if i == 0 or code[i - 1] != "\\":
+                    in_double_quote = not in_double_quote
+
+            if not in_single_quote and not in_double_quote:
+                if ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth = max(0, depth - 1)
+                elif ch == ";" and depth == 0:
+                    current.append(ch)
+                    statements.append("".join(current))
+                    current = []
+                    i += 1
+                    continue
+
+            current.append(ch)
+            i += 1
+
+        # Flush trailing content
+        remainder = "".join(current).strip()
+        if remainder:
+            statements.append(remainder)
+
+        return statements
+
+    # ── Gurobi configuration ──────────────────────────────────────────────
+
+    def configure_gurobi(
+        self,
+        params: Optional[dict[str, Any]] = None,
+        preset: Optional[str] = None,
+    ) -> dict:
+        """
+        Configure Gurobi solver parameters with built-in domain knowledge.
+
+        *preset* can be one of:
+          - "default"   — reset to Gurobi defaults
+          - "tune"      — enable automatic parameter tuning
+          - "fast"      — emphasise speed over accuracy
+          - "precise"   — emphasise accuracy (tight MIP gaps, no shortcuts)
+          - "heuristic" — prioritise finding feasible solutions quickly
+          - "balanced"  — moderate settings for general use
+          - "barrier"   — use barrier algorithm for LP/QP
+
+        *params* is a dict of explicit Gurobi parameter key-value pairs
+        (e.g., {"MIPGap": 0.01, "TimeLimit": 300, "Threads": 4}).
+        """
+        ampl = self.ensure_runtime()
+
+        # Ensure Gurobi is the active solver
+        if "gurobi" not in self.available_solvers:
+            return {
+                "status": "error",
+                "solver": self.current_solver,
+                "params_set": [],
+                "params_failed": [],
+                "ampl_option_string": "",
+                "message": "Gurobi solver is not available on this system. Detected solvers: "
+                           + ", ".join(self.available_solvers),
+            }
+
+        try:
+            ampl.set_option("solver", "gurobi")
+            self.current_solver = "gurobi"
+        except Exception as exc:
+            logger.warning("Could not switch to Gurobi: %s", exc)
+
+        merged_params: dict[str, Any] = {}
+
+        # Apply preset
+        preset_str = (preset or "").lower().strip()
+        if preset_str and preset_str in GUROBI_PRESETS:
+            merged_params.update(GUROBI_PRESETS[preset_str])
+        elif preset_str and preset_str not in GUROBI_PRESETS:
+            return {
+                "status": "error",
+                "solver": "gurobi",
+                "params_set": [],
+                "params_failed": [],
+                "ampl_option_string": "",
+                "message": f"Unknown preset '{preset}'. Available: {list(GUROBI_PRESETS.keys())}",
+            }
+
+        # Overlay explicit params
+        if params:
+            merged_params.update(params)
+
+        # Build the gurobi_options string
+        option_parts = []
+        for key, value in merged_params.items():
+            option_parts.append(f"{key}={value}")
+        option_string = " ".join(option_parts)
+
+        # Apply via AMPL option
+        params_set: list[dict] = []
+        params_failed: list[str] = []
+
+        try:
+            ampl.set_option("gurobi_options", option_string)
+            logger.info("Gurobi options set: %s", option_string)
+
+            for key, value in merged_params.items():
+                info = GUROBI_PARAM_DB.get(key, {})
+                params_set.append({
+                    "name": key,
+                    "value": value,
+                    "description": info.get("desc", ""),
+                    "category": info.get("category", ""),
+                })
+        except Exception as exc:
+            params_failed.append(str(exc))
+            logger.error("Failed to set Gurobi options: %s", exc)
+
+        return {
+            "status": "success" if not params_failed else "error",
+            "solver": "gurobi",
+            "params_set": params_set,
+            "params_failed": params_failed,
+            "ampl_option_string": f"option gurobi_options '{option_string}';",
+            "message": f"Set {len(params_set)} Gurobi parameter(s)"
+                       + (f" (preset={preset_str})" if preset_str else ""),
+        }
+
     # ── Infeasible diagnostics ────────────────────────────────────────────
 
     def _diagnose_infeasibility(self) -> InfeasibleDiagnostics:
@@ -826,3 +1068,139 @@ class AMPLEngine:
         except Exception:
             pass
         return summary
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Gurobi Parameter Knowledge Base
+# ═══════════════════════════════════════════════════════════════════════════════
+
+GUROBI_PRESETS: dict[str, dict[str, Any]] = {
+    "default": {},
+    "tune": {
+        "TuneTimeLimit": 60,
+        "TuneOutput": 1,
+    },
+    "fast": {
+        "MIPGap": 0.01,
+        "MIPFocus": 1,
+        "Presolve": 2,
+        "Cuts": 1,
+        "Heuristics": 0.3,
+        "Threads": 4,
+        "Method": 2,
+    },
+    "precise": {
+        "MIPGap": 0.0001,
+        "MIPFocus": 3,
+        "NumericFocus": 1,
+        "Presolve": 2,
+        "Cuts": 3,
+        "IntegralityFocus": 1,
+        "Symmetry": 2,
+    },
+    "heuristic": {
+        "MIPFocus": 1,
+        "Heuristics": 0.8,
+        "Cuts": 0,
+        "Presolve": 1,
+        "NoRelHeurTime": 30,
+        "ZeroObjNodes": 10000,
+    },
+    "balanced": {
+        "MIPGap": 0.001,
+        "MIPFocus": 0,
+        "Presolve": 2,
+        "Cuts": 2,
+        "Threads": 4,
+    },
+    "barrier": {
+        "Method": 2,
+        "Crossover": 0,
+        "BarHomogeneous": 1,
+        "BarConvTol": 1e-12,
+    },
+}
+
+GUROBI_PARAM_DB: dict[str, dict[str, str]] = {
+    # ── Termination ──
+    "TimeLimit":     {"desc": "Solver time limit in seconds", "category": "Termination"},
+    "MIPGap":        {"desc": "Relative MIP optimality gap tolerance", "category": "Termination"},
+    "MIPGapAbs":     {"desc": "Absolute MIP optimality gap tolerance", "category": "Termination"},
+    "NodeLimit":     {"desc": "Maximum MIP nodes to explore", "category": "Termination"},
+    "IterationLimit":{"desc": "Maximum simplex iterations", "category": "Termination"},
+    "SolutionLimit": {"desc": "Stop after finding this many feasible solutions", "category": "Termination"},
+    "BestBdStop":    {"desc": "Stop when best bound reaches this value", "category": "Termination"},
+    "BestObjStop":   {"desc": "Stop when best objective reaches this value", "category": "Termination"},
+    "Cutoff":        {"desc": "Discard solutions worse than this value", "category": "Termination"},
+
+    # ── MIP Strategy ──
+    "MIPFocus":      {"desc": "MIP solver focus: 0=balanced, 1=feasible, 2=optimal, 3=bound", "category": "MIP"},
+    "Heuristics":    {"desc": "Time spent on heuristics (0-1)", "category": "MIP"},
+    "NoRelHeurTime": {"desc": "Heuristic time before root relaxation (seconds)", "category": "MIP"},
+    "ZeroObjNodes":  {"desc": "Number of zero-objective nodes to explore", "category": "MIP"},
+    "BranchDir":     {"desc": "Branch direction preference (-1=down, 0=auto, 1=up)", "category": "MIP"},
+    "VarBranch":     {"desc": "Variable branching rule (-1=auto, 0=pseudo, 1=strong)", "category": "MIP"},
+    "PumpPasses":    {"desc": "Number of feasibility pump passes", "category": "MIP"},
+    "RINS":          {"desc": "RINS heuristic frequency (-1=auto, 0=off)", "category": "MIP"},
+    "ZeroHalfCuts":  {"desc": "Zero-half cut aggressiveness (0-2)", "category": "MIP"},
+    "SubMIPNodes":   {"desc": "Nodes explored in sub-MIP heuristics", "category": "MIP"},
+
+    # ── Cuts ──
+    "Cuts":          {"desc": "Global cut aggressiveness (-1=auto, 0=none, 1=moderate, 2=aggressive, 3=very aggressive)", "category": "Cuts"},
+    "CliqueCuts":    {"desc": "Clique cut aggressiveness", "category": "Cuts"},
+    "CoverCuts":     {"desc": "Cover cut aggressiveness", "category": "Cuts"},
+    "FlowCoverCuts": {"desc": "Flow cover cut aggressiveness", "category": "Cuts"},
+    "GomoryPasses":  {"desc": "Gomory cut passes", "category": "Cuts"},
+    "MIRCuts":       {"desc": "MIR cut aggressiveness", "category": "Cuts"},
+    "NetworkCuts":   {"desc": "Network cut aggressiveness", "category": "Cuts"},
+    "ModKCuts":      {"desc": "Mod-K cut aggressiveness", "category": "Cuts"},
+
+    # ── Presolve ──
+    "Presolve":      {"desc": "Presolve aggressiveness (-1=auto, 0=none, 1=conservative, 2=aggressive)", "category": "Presolve"},
+    "PreDual":       {"desc": "Presolve dual reduction (-1=auto, 0=off, 1=on)", "category": "Presolve"},
+    "PrePasses":     {"desc": "Presolve passes limit (-1=auto)", "category": "Presolve"},
+    "Symmetry":      {"desc": "Symmetry detection (0=none, 1=moderate, 2=aggressive)", "category": "Presolve"},
+    "Aggregate":     {"desc": "Aggregate variables in presolve (0=off, 1=on)", "category": "Presolve"},
+
+    # ── Algorithm ──
+    "Method":        {"desc": "LP solver method (-1=auto, 0=primal simplex, 1=dual simplex, 2=barrier, 3=concurrent)", "category": "Algorithm"},
+    "Crossover":     {"desc": "Barrier crossover (0=off, 1=on)", "category": "Algorithm"},
+    "BarHomogeneous":{"desc": "Barrier homogeneous algorithm (0=off, 1=on)", "category": "Algorithm"},
+    "BarConvTol":    {"desc": "Barrier convergence tolerance", "category": "Algorithm"},
+    "BarOrder":      {"desc": "Barrier ordering algorithm (-1=auto, 0=approx minimum degree, 1=nested dissection)", "category": "Algorithm"},
+    "ConcurrentMIP": {"desc": "Number of concurrent MIP solves", "category": "Algorithm"},
+    "ConcurrentJobs": {"desc": "Distributed concurrent jobs", "category": "Algorithm"},
+
+    # ── Numerics ──
+    "NumericFocus":  {"desc": "Numerical precision focus (0=auto, 1=moderate, 2=most precise)", "category": "Numerics"},
+    "FeasibilityTol":{"desc": "Feasibility tolerance", "category": "Numerics"},
+    "OptimalityTol": {"desc": "Optimality tolerance (reduced cost)", "category": "Numerics"},
+    "IntFeasTol":    {"desc": "Integer feasibility tolerance", "category": "Numerics"},
+    "MarkowitzTol":  {"desc": "Markowitz tolerance for simplex", "category": "Numerics"},
+    "ScaleFlag":     {"desc": "Model scaling (0=none, 1=row, 2=column, 3=both)", "category": "Numerics"},
+
+    # ── Performance ──
+    "Threads":       {"desc": "Number of threads / CPU cores", "category": "Performance"},
+    "MemLimit":      {"desc": "Memory limit in GB", "category": "Performance"},
+    "NodefileStart": {"desc": "Nodefile start threshold (GB of memory)", "category": "Performance"},
+    "NodefileDir":   {"desc": "Directory for nodefile storage", "category": "Performance"},
+
+    # ── Tuning ──
+    "TuneTimeLimit": {"desc": "Time limit for parameter tuning (seconds)", "category": "Tuning"},
+    "TuneOutput":    {"desc": "Tuning output verbosity (0-3)", "category": "Tuning"},
+    "TuneTrials":    {"desc": "Number of tuning trials per parameter set", "category": "Tuning"},
+    "TuneResults":   {"desc": "Number of tuning results to return", "category": "Tuning"},
+
+    # ── Output ──
+    "OutputFlag":    {"desc": "Enable (1) or disable (0) solver output", "category": "Output"},
+    "LogFile":       {"desc": "Write solver log to file", "category": "Output"},
+    "DisplayInterval": {"desc": "Log line interval (seconds)", "category": "Output"},
+
+    # ── IIS ──
+    "IISMethod":     {"desc": "IIS computation method (0=fast heuristic, 1=more thorough)", "category": "IIS"},
+
+    # ── Distributed ──
+    "DistributedMIPJobs": {"desc": "Number of distributed MIP workers", "category": "Distributed"},
+    "WorkerPassword":      {"desc": "Distributed worker password", "category": "Distributed"},
+    "WorkerPool":          {"desc": "Cluster worker pool specification", "category": "Distributed"},
+}

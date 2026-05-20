@@ -43,6 +43,8 @@ workflows where multi-round experimentation is the norm, not a one-off.
     - [5. `extract_solution`](#5-extract_solution)
     - [6. `get_session_state`](#6-get_session_state)
     - [7. `set_solver_options`](#7-set_solver_options)
+    - [8. `run_ampl_script`](#8-run_ampl_script)
+    - [9. `configure_gurobi`](#9-configure_gurobi)
   - [Example Workflow](#example-workflow)
   - [LLM Client Configuration](#llm-client-configuration)
     - [Claude Desktop](#claude-desktop)
@@ -216,7 +218,7 @@ working one if the default (`highs`) is unavailable.
 
 ## MCP Tools
 
-All seven tools are documented below with their purpose, signature, and return shape.
+All nine tools are documented below with their purpose, signature, and return shape.
 
 ### 1. `reset_workspace`
 
@@ -346,6 +348,71 @@ set_solver_options(options_json: str) → {
 
 Example: `'{"outlev": 1, "timelim": 60, "threads": 4}'`
 
+### 8. `run_ampl_script`
+
+Execute an AMPL `.run` script (command file) in the persistent session.
+
+`.run` files are AMPL's scripting mechanism — they support `for` / `repeat` loops,
+`if-then-else` conditionals, multiple `solve` statements with parameter sweeps,
+`let` for in-place parameter changes, and `display` / `printf` for output.
+
+This is the preferred tool for **iterative optimisation workflows**: sensitivity
+analysis, parameter sweeps, decomposition algorithms, and any workflow requiring
+more than a single solve. The tool captures the result of **every** solve within
+the script.
+
+```
+run_ampl_script(
+  script_code: str,
+  save_path: str = ""
+) → {
+  status: str,
+  message: str,
+  script_path: str | null,     // path if saved to disk
+  total_solves: int,
+  solve_results: [{
+    solve_index: int,           // 1-based solve index
+    label: str,
+    solve_result: str,
+    objective_value: float | null,
+    runtime_seconds: float
+  }],
+  ampl_stdout: str,             // full AMPL interpreter output
+  errors: [str]                 // per-statement errors (non-fatal)
+}
+```
+
+### 9. `configure_gurobi`
+
+Configure Gurobi solver parameters with a built-in knowledge base of 50+ parameters
+and 7 named presets.
+
+**Presets**: `default`, `tune` (auto parameter tuning), `fast` (speed over accuracy),
+`precise` (tight tolerances), `heuristic` (feasibility first), `balanced` (general use),
+`barrier` (interior-point LP/QP).
+
+**Known parameters** (50+): TimeLimit, MIPGap, MIPFocus, Heuristics, Cuts, Presolve,
+Method, Threads, NumericFocus, Symmetry, BarConvTol, and many more — each with
+human-readable descriptions.
+
+```
+configure_gurobi(
+  params_json: str = "{}",      // e.g. '{"MIPGap": 0.005, "TimeLimit": 120}'
+  preset: str = ""              // named preset (see above)
+) → {
+  solver: str,
+  params_set: [{
+    name: str,
+    value: any,
+    description: str,
+    category: str               // e.g. MIP, Termination, Cuts, Algorithm
+  }],
+  params_failed: [str],
+  ampl_option_string: str,      // assembled 'option gurobi_options ...' string
+  message: str
+}
+```
+
 ---
 
 ## Example Workflow
@@ -382,6 +449,22 @@ LLM → run_optimization("highs")
 # Session 6: If infeasible
 → { solve_result: "infeasible",
     diagnostics: { infeasible_constraints: [...], relaxation_suggestions: [...] } }
+
+# Session 7: Parameter sweep with .run script
+LLM → configure_gurobi(preset="fast", params_json='{"TimeLimit": 60}')
+LLM → run_ampl_script("""
+    for {c in 0..100 by 10} {
+        let capacity := capacity * (1 + c/100.0);
+        solve;
+        display capacity, total_profit;
+    }
+""")
+→ { total_solves: 11,
+    solve_results: [
+      { solve_index: 1, solve_result: "solved", objective_value: 14250.0 },
+      { solve_index: 2, solve_result: "solved", objective_value: 15675.0 },
+      ...
+    ] }
 ```
 ---
 

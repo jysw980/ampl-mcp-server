@@ -35,6 +35,8 @@ from schemas import (
     ExtractSolutionResponse,
     SessionStateResponse,
     SetSolverOptionsResponse,
+    RunScriptResponse,
+    GurobiConfigResponse,
     ErrorResponse,
     ErrorDetail,
 )
@@ -358,6 +360,128 @@ def set_solver_options(options_json: str) -> dict:
         ).model_dump()
     except Exception as exc:
         logger.error("set_solver_options failed: %s", exc)
+        return _error_response(exc).model_dump()
+
+
+# ─── Tool 8: run_ampl_script ──────────────────────────────────────────────────
+
+
+@mcp.tool()
+def run_ampl_script(script_code: str, save_path: str = "") -> dict:
+    """
+    Execute an AMPL .run script (command file) in the persistent session.
+
+    .run files are AMPL's scripting mechanism — they support:
+      - for / repeat loops
+      - if-then-else conditionals
+      - multiple solve statements with parameter sweeps
+      - let statements for in-place parameter changes
+      - display / print / printf for output
+      - include / model / data for composing model components
+
+    This is the preferred tool for iterative optimisation workflows:
+    sensitivity analysis, parameter sweeps, decomposition algorithms,
+    and any workflow requiring more than a single solve.
+
+    The tool captures the result of every solve within the script
+    and returns them as a list.
+
+    Args:
+        script_code: Full .run script source code as a string.
+        save_path:   Optional path to save the script to disk for reuse.
+    """
+    logger.info("Tool: run_ampl_script | chars=%d | save=%s", len(script_code), save_path or "(none)")
+    try:
+        engine = get_engine()
+        sp = save_path.strip() if save_path else None
+        result = engine.run_script(script_code, save_path=sp)
+
+        return RunScriptResponse(
+            status=result.get("status", "success"),
+            message=result["message"],
+            script_path=result.get("script_path"),
+            total_solves=result["total_solves"],
+            solve_results=result["solve_results"],
+            ampl_stdout=result.get("ampl_stdout", ""),
+            errors=result.get("errors", []),
+        ).model_dump()
+    except Exception as exc:
+        logger.error("run_ampl_script failed: %s", exc)
+        return _error_response(exc).model_dump()
+
+
+# ─── Tool 9: configure_gurobi ──────────────────────────────────────────────────
+
+
+@mcp.tool()
+def configure_gurobi(params_json: str = "{}", preset: str = "") -> dict:
+    """
+    Configure Gurobi solver parameters with built-in domain knowledge.
+
+    Supports named presets for common optimisation profiles, plus explicit
+    parameter overrides via a JSON object.
+
+    Available presets:
+      - "default"    — reset to Gurobi defaults
+      - "tune"       — enable automatic parameter tuning (finds best params)
+      - "fast"       — emphasise speed over provable optimality
+      - "precise"    — tight tolerances, focus on provable optimality
+      - "heuristic"  — prioritise finding feasible solutions quickly
+      - "balanced"   — moderate settings suitable for most problems
+      - "barrier"    — use interior-point method for LP/QP
+
+    Known parameters include: TimeLimit, MIPGap, MIPFocus, Heuristics, Cuts,
+    Presolve, Method, Threads, NumericFocus, Symmetry, BarConvTol, and 50+ more.
+
+    Args:
+        params_json: JSON object of explicit Gurobi parameter overrides, e.g.
+                     '{"MIPGap": 0.005, "TimeLimit": 120, "Threads": 8}'.
+        preset:      Named configuration preset (see list above).
+    """
+    logger.info("Tool: configure_gurobi | preset=%s | params=%s", preset, params_json)
+    try:
+        import json
+
+        params: Optional[dict[str, Any]] = json.loads(params_json)
+        if params is not None and not isinstance(params, dict):
+            return ErrorResponse(
+                status="error",
+                error=ErrorDetail(
+                    error_type="ValueError",
+                    message="params_json must deserialize to a JSON object (key-value pairs).",
+                    traceback="",
+                ),
+            ).model_dump()
+
+        engine = get_engine()
+        result = engine.configure_gurobi(
+            params=params if params else None,
+            preset=preset.strip() if preset.strip() else None,
+        )
+
+        if result.get("status") == "error":
+            return ErrorResponse(
+                status="error",
+                error=ErrorDetail(
+                    error_type="GurobiConfigError",
+                    message=result.get("message", ""),
+                    traceback="",
+                ),
+            ).model_dump()
+
+        return GurobiConfigResponse(**result).model_dump()
+
+    except json.JSONDecodeError as exc:
+        return ErrorResponse(
+            status="error",
+            error=ErrorDetail(
+                error_type="JSONDecodeError",
+                message=f"Invalid JSON in params_json: {exc}",
+                traceback="",
+            ),
+        ).model_dump()
+    except Exception as exc:
+        logger.error("configure_gurobi failed: %s", exc)
         return _error_response(exc).model_dump()
 
 

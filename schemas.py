@@ -126,6 +126,44 @@ class SetSolverOptionsResponse(BaseResponse):
     message: str = Field(default="")
 
 
+# ─── Tool 8: run_ampl_script ──────────────────────────────────────────────────
+
+class ScriptSolveResult(BaseModel):
+    """Result from a single solve within a .run script."""
+    solve_index: int = Field(default=0, description="1-based solve index within the script")
+    label: str = Field(default="", description="Context label if available")
+    solve_result: str = Field(default="")
+    objective_value: Optional[float] = Field(default=None)
+    runtime_seconds: float = Field(default=0.0)
+
+
+class RunScriptResponse(BaseResponse):
+    message: str = Field(default="")
+    script_path: Optional[str] = Field(default=None, description="Path if saved to disk")
+    total_solves: int = Field(default=0)
+    solve_results: list[ScriptSolveResult] = Field(default_factory=list)
+    ampl_stdout: str = Field(default="", description="Full AMPL interpreter output")
+    errors: list[str] = Field(default_factory=list)
+
+
+# ─── Tool 9: configure_gurobi ─────────────────────────────────────────────────
+
+class GurobiParamInfo(BaseModel):
+    """Metadata about a single Gurobi parameter."""
+    name: str
+    value: Any
+    description: str = Field(default="")
+    category: str = Field(default="", description="e.g. MIP, Barrier, Tuning, Termination")
+
+
+class GurobiConfigResponse(BaseResponse):
+    solver: str = Field(default="gurobi")
+    params_set: list[GurobiParamInfo] = Field(default_factory=list)
+    params_failed: list[str] = Field(default_factory=list)
+    ampl_option_string: str = Field(default="", description="Assembled 'gurobi_options' string")
+    message: str = Field(default="")
+
+
 # ─── Union type for tool dispatch ────────────────────────────────────────────
 
 ToolResponse = Union[
@@ -136,5 +174,7 @@ ToolResponse = Union[
     ExtractSolutionResponse,
     SessionStateResponse,
     SetSolverOptionsResponse,
+    RunScriptResponse,
+    GurobiConfigResponse,
     ErrorResponse,
 ]
