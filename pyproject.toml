@@ -1,0 +1,54 @@
+[project]
+name = "ampl-mcp-server"
+version = "1.0.0"
+description = "AMPL MCP Server — Academic Optimization Research Edition (stateful AMPL session for LLMs)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [
+    { name = "AMPL MCP Server Contributors" }
+]
+keywords = ["ampl", "mcp", "optimization", "operations-research", "mathematical-programming"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Mathematics",
+]
+
+dependencies = [
+    "fastmcp>=2.0.0",
+    "amplpy>=0.13.0",
+    "pandas>=2.0.0",
+    "openpyxl>=3.1.0",
+    "xlrd>=2.0.1",
+    "pydantic>=2.0.0",
+    "anyio>=4.0.0",
+    "numpy>=1.24.0",
+]
+
+[project.scripts]
+ampl-mcp-server = "server:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+    "ruff>=0.3.0",
+]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 110
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "UP"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
